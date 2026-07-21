@@ -1,6 +1,6 @@
 {
   "name": "openfox-github-copilot",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "GitHub Copilot account provider plugin for OpenFox",
   "type": "module",
   "main": "./dist/index.js",
