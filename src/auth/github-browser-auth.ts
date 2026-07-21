@@ -19,12 +19,19 @@ export class GitHubCopilotAuthAdapter implements ProviderAuthAdapter {
     completion: Promise<{ credentialRef: string }>
   }>()
   private readonly tokens: GitHubAccountTokenClient
+  private readonly nowSec: () => number
 
   constructor(
     private readonly credentials: ProviderCredentialStore,
     options: GitHubCopilotAuthOptions = {},
   ) {
+    const now = options.now ?? Date.now
     this.tokens = new GitHubAccountTokenClient(credentials, options)
+    this.nowSec = () => now() / 1000
+  }
+
+  async refreshCopilotToken(credentialRef: string): Promise<void> {
+    await this.tokens.refreshCopilotToken(credentialRef)
   }
 
   async beginLogin(context: { providerId: string }): Promise<{
@@ -67,19 +74,20 @@ export class GitHubCopilotAuthAdapter implements ProviderAuthAdapter {
   async getStatus(context: { providerId: string; credentialRef?: string }): Promise<ProviderAuthStatus> {
     if (!context.credentialRef) return { state: 'disconnected' }
 
-    const credential = await this.credentials.get(context.credentialRef) as { username?: string; oauthToken?: string } | undefined
-    if (!credential) return { state: 'disconnected' }
+    const raw = await this.credentials.get(context.credentialRef) as { username?: string; oauthToken?: string; copilotToken?: string; copilotExpiresAt?: number } | undefined
+    if (!raw) return { state: 'disconnected' }
+
+    if (raw.copilotToken && raw.copilotExpiresAt && raw.copilotExpiresAt > this.nowSec()) {
+      return { state: 'connected', accountLabel: raw.username }
+    }
 
     try {
-      const tokenData = await this.tokens.fetchCopilotToken(credential.oauthToken!)
-      if (tokenData.token) {
-        return { state: 'connected', accountLabel: credential.username }
-      }
-      return { state: 'error', accountLabel: credential.username, error: 'GitHub Copilot subscription not active' }
+      const credential = await this.tokens.getValidCredential(context.credentialRef)
+      return { state: 'connected', accountLabel: credential.username }
     } catch (err) {
       return {
         state: 'expired',
-        accountLabel: credential.username,
+        accountLabel: raw.username,
         error: err instanceof Error ? err.message : String(err),
       }
     }
@@ -103,6 +111,10 @@ export class GitHubCopilotAuthAdapter implements ProviderAuthAdapter {
     const credential = await this.credentials.get(credentialRef) as { oauthToken?: string } | undefined
     if (!credential?.oauthToken) throw new Error('OAuth token not found')
     return credential.oauthToken
+  }
+
+  async invalidateCopilotToken(credentialRef: string): Promise<void> {
+    await this.tokens.invalidateCopilotToken(credentialRef)
   }
 
   async logout(credentialRef: string): Promise<void> {

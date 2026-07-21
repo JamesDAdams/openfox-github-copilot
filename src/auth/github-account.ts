@@ -33,19 +33,22 @@ interface GitHubUserResponse {
 export interface GitHubAccountTokenClientOptions {
   fetcher?: typeof fetch
   now?: () => number
+  refreshMarginSeconds?: number
 }
 
 export class GitHubAccountTokenClient {
   private readonly request: typeof fetch
   private readonly now: () => number
+  private readonly refreshMarginSeconds: number
+  private readonly refreshes = new Map<string, Promise<GitHubCopilotCredential>>()
   private readonly clientId = 'Iv1.b507a08c87ecfe98'
-
   constructor(
     private readonly credentials: ProviderCredentialStore,
     options: GitHubAccountTokenClientOptions = {},
   ) {
     this.request = options.fetcher ?? fetch
     this.now = options.now ?? Date.now
+    this.refreshMarginSeconds = options.refreshMarginSeconds ?? 300
   }
 
   async beginDeviceLogin(): Promise<{
@@ -128,23 +131,53 @@ export class GitHubAccountTokenClient {
     if (!res.ok) throw new Error(`Failed to fetch Copilot token: ${res.statusText} (${res.status})`)
 
     const data = (await res.json()) as GitHubCopilotTokenResponse
+    if (!data.token) throw new Error('Copilot token response is empty')
+
     const expiresAt = typeof data.expires_at === 'number' ? data.expires_at : Math.floor(new Date(data.expires_at).getTime() / 1000)
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) throw new Error('Copilot token has invalid expiration')
 
     return { token: data.token, expiresAt }
+  }
+
+  async refreshCopilotToken(reference: string): Promise<GitHubCopilotCredential> {
+    const existing = this.refreshes.get(reference)
+    if (existing) return existing
+
+    const promise = (async () => {
+      try {
+        const credential = (await this.credentials.get(reference)) as GitHubCopilotCredential | undefined
+        if (!credential) throw new Error('GitHub Copilot credential not found')
+
+        const tokenData = await this.fetchCopilotToken(credential.oauthToken)
+        credential.copilotToken = tokenData.token
+        credential.copilotExpiresAt = tokenData.expiresAt
+        await this.credentials.set(reference, credential)
+        return credential
+      } finally {
+        this.refreshes.delete(reference)
+      }
+    })()
+
+    this.refreshes.set(reference, promise)
+    return promise
   }
 
   async getValidCredential(reference: string): Promise<GitHubCopilotCredential> {
     const credential = (await this.credentials.get(reference)) as GitHubCopilotCredential | undefined
     if (!credential) throw new Error('GitHub Copilot credential not found')
 
-    const bufferSeconds = 60
-    const isExpired = !credential.copilotExpiresAt || this.now() / 1000 >= credential.copilotExpiresAt - bufferSeconds
+    const isExpired = !credential.copilotExpiresAt || this.now() / 1000 >= credential.copilotExpiresAt - this.refreshMarginSeconds
     if (credential.copilotToken && !isExpired) return credential
 
-    const tokenData = await this.fetchCopilotToken(credential.oauthToken)
-    credential.copilotToken = tokenData.token
-    credential.copilotExpiresAt = tokenData.expiresAt
+    return this.refreshCopilotToken(reference)
+  }
+
+  async invalidateCopilotToken(reference: string, currentToken?: string): Promise<void> {
+    const credential = (await this.credentials.get(reference)) as GitHubCopilotCredential | undefined
+    if (!credential) return
+    if (currentToken !== undefined && credential.copilotToken !== currentToken) return
+    credential.copilotToken = undefined
+    credential.copilotExpiresAt = undefined
     await this.credentials.set(reference, credential)
-    return credential
   }
 }

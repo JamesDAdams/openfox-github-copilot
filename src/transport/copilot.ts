@@ -17,6 +17,26 @@ const GITHUB_CATALOG_API = 'https://models.github.ai/catalog/models'
 
 const LOOKAROUND_RE = /\(\?[=!]|\(\?<[=!]/
 
+function isAuthHttpError(error: string): boolean {
+  if (/ \(40[13]\):/.test(error)) return true
+  if (!/ \(400\):/.test(error)) return false
+  const body = error.replace(/^GitHub Copilot API error \(400\): /, '')
+  return /token|auth|credential|unauthorized|forbidden|expired/i.test(body)
+}
+
+function signalMerge(...signals: (AbortSignal | undefined)[]): AbortSignal {
+  const valid = signals.filter(Boolean) as AbortSignal[]
+  if (valid.length === 0) return new AbortController().signal
+  if (valid.length === 1) return valid[0]
+  if (typeof AbortSignal.any !== 'undefined') return AbortSignal.any(valid)
+  const controller = new AbortController()
+  for (const s of valid) {
+    if (s.aborted) { controller.abort(s.reason); break }
+    s.addEventListener('abort', () => controller.abort(s.reason), { once: true })
+  }
+  return controller.signal
+}
+
 function sanitizeSchema(obj: unknown): unknown {
   if (Array.isArray(obj)) return obj.map(sanitizeSchema)
   if (obj && typeof obj === 'object') {
@@ -184,18 +204,59 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
       return
     }
 
-    try {
-      const access = await this.auth.getAccessContext(context.credentialRef)
-      const model = context.model || 'gpt-5-mini'
-      const endpoint = this.getModelEndpoint(model)
+    const model = context.model || 'gpt-5-mini'
+    const endpoint = this.getModelEndpoint(model)
 
-      if (endpoint === '/responses') {
-        yield* this.streamResponses(request, access, model)
-      } else {
-        yield* this.streamChatCompletions(request, access, model, request.signal)
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const retrySignal = new AbortController()
+      const combined = signalMerge(retrySignal.signal, request.signal)
+
+      let access: ProviderAccessContext
+      try {
+        access = await this.auth.getAccessContext(context.credentialRef)
+      } catch {
+        if (attempt === 2) {
+          yield { type: 'error', error: 'Failed to authenticate with GitHub Copilot' }
+          return
+        }
+        try {
+          await this.auth.refreshCopilotToken(context.credentialRef)
+        } catch {
+          yield { type: 'error', error: 'Failed to refresh GitHub Copilot token' }
+          return
+        }
+        continue
       }
-    } catch (error: any) {
-      yield { type: 'error', error: error.message || String(error) }
+
+      const streamGen = endpoint === '/responses'
+        ? this.streamResponses(request, access, model)
+        : this.streamChatCompletions(request, access, model, combined)
+
+      let shouldRetry = false
+      try {
+        for await (const event of streamGen) {
+          if (attempt === 1 && event.type === 'error' && isAuthHttpError(event.error)) {
+            shouldRetry = true
+            retrySignal.abort()
+            try {
+              await this.auth.refreshCopilotToken(context.credentialRef)
+            } catch {
+              yield { type: 'error', error: 'Failed to refresh GitHub Copilot token' }
+              return
+            }
+            break
+          }
+          yield event
+        }
+      } catch (error: any) {
+        if (request.signal?.aborted) {
+          yield { type: 'error', error: 'Request aborted' }
+          return
+        }
+        yield { type: 'error', error: error.message || String(error) }
+        return
+      }
+      if (!shouldRetry) return
     }
   }
 
