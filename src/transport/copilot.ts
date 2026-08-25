@@ -11,11 +11,33 @@ import type {
   LLMToolDefinition,
 } from 'openfox/provider'
 import { GitHubCopilotAuthAdapter } from '../auth/github-browser-auth.js'
-import { getDefaultModels } from '../catalog/models-default.js'
-
 const GITHUB_CATALOG_API = 'https://models.github.ai/catalog/models'
 
 const LOOKAROUND_RE = /\(\?[=!]|\(\?<[=!]/
+
+// Models that advertise an extended (1 million token) context window. The
+// /models endpoint does not surface this capability, so we mirror the curated
+// list from GitHub's "Models with extended capabilities" docs.
+const EXTENDED_CONTEXT_MODELS = new Set([
+  'claude-sonnet-4.6',
+  'claude-opus-4.6',
+  'claude-opus-4.7',
+  'claude-opus-4.8',
+  'claude-opus-5',
+  'claude-sonnet-5',
+  'gpt-5.3-codex',
+  'gpt-5.4',
+  'gpt-5.5',
+  'gpt-5.6-luna',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'kimi-k3',
+  // Gemini models have a native 1M context window even though Copilot's CAPI
+  // advertises a lower max_context_window_tokens (264000).
+  'gemini-3.1-pro',
+  'gemini-3.1-pro-preview',
+  'gemini-3.6-flash',
+])
 
 function isAuthHttpError(error: string): boolean {
   if (/ \(40[13]\):/.test(error)) return true
@@ -48,22 +70,6 @@ function sanitizeSchema(obj: unknown): unknown {
     return result
   }
   return obj
-}
-
-function mergeModels(defaults: ModelConfig[], apiModels: ModelConfig[]): ModelConfig[] {
-  const seen = new Set<string>()
-  const merged: ModelConfig[] = []
-
-  for (const m of apiModels) {
-    seen.add(m.id)
-    merged.push(m)
-  }
-
-  for (const m of defaults) {
-    if (!seen.has(m.id)) merged.push(m)
-  }
-
-  return merged
 }
 
 export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
@@ -108,29 +114,29 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
   }
 
   async listModels(context: ProviderRequestContext): Promise<ModelConfig[]> {
-    const defaults = getDefaultModels()
-
-    if (!context.credentialRef) return defaults
+    if (!context.credentialRef) return this.cachedModels
 
     let access: ProviderAccessContext
     try {
       access = await this.auth.getAccessContext(context.credentialRef)
     } catch {
-      return defaults
+      return this.cachedModels
     }
 
     const copilotModels = await this.fetchCopilotModels(access.headers ?? {})
 
     if (copilotModels.length > 0) {
-      return mergeModels(defaults, copilotModels)
+      this.cachedModels = copilotModels
+      return copilotModels
     }
 
     const catalog = await this.fetchGitHubCatalog(context.credentialRef)
     if (catalog.length > 0) {
-      return mergeModels(defaults, catalog)
+      this.cachedModels = catalog
+      return catalog
     }
 
-    return defaults
+    return this.cachedModels
   }
 
   private async fetchCopilotModels(headers: Record<string, string>): Promise<ModelConfig[]> {
@@ -149,7 +155,8 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
           name?: string
           capabilities?: {
             type?: string
-            limits?: { max_prompt_tokens?: number; max_context_window_tokens?: number }
+            limits?: { max_prompt_tokens?: number; max_context_window_tokens?: number; max_output_tokens?: number }
+            supports?: { vision?: boolean; reasoning_effort?: string[] }
           }
           supported_endpoints?: string[]
         }>
@@ -169,13 +176,21 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
           this.modelEndpoints.set(m.id, '/responses')
         }
 
+        const limits = m.capabilities?.limits
+        const supports = m.capabilities?.supports
         const mc: ModelConfig = {
           id: m.id,
           name: m.name || m.id,
-          contextWindow: m.capabilities?.limits?.max_prompt_tokens
-            ?? m.capabilities?.limits?.max_context_window_tokens
-            ?? 128000,
+          contextWindow: EXTENDED_CONTEXT_MODELS.has(m.id)
+            ? 1_000_000
+            : limits?.max_context_window_tokens
+              ?? limits?.max_prompt_tokens
+              ?? 128000,
           source: 'backend',
+          ...(supports?.vision !== undefined && { supportsVision: supports.vision }),
+          ...(Array.isArray(supports?.reasoning_effort) && supports.reasoning_effort.length
+            ? { reasoningEfforts: supports.reasoning_effort }
+            : {}),
         }
         if (!hasChat && hasResponses) {
           mc.requestBody = { endpoint: '/responses' }
@@ -261,15 +276,15 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
   }
 
   private getModelEndpoint(modelId: string): string {
-    const defaults = getDefaultModels()
-    const m = defaults.find(d => d.id === modelId)
-    if (m?.requestBody?.endpoint === '/responses') return '/responses'
     const known = this.modelEndpoints.get(modelId)
     if (known === '/responses') return '/responses'
+    const cached = this.cachedModels.find(m => m.id === modelId)
+    if (cached?.requestBody?.endpoint === '/responses') return '/responses'
     return '/chat/completions'
   }
 
   private readonly modelEndpoints = new Map<string, string>()
+  private cachedModels: ModelConfig[] = []
 
   private async *streamChatCompletions(
     request: LLMCompletionRequest,

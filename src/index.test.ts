@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ProviderPluginRegistry } from 'openfox/provider'
 import { register } from './index.js'
-import { getDefaultModels } from './catalog/models-default.js'
 import { GitHubCopilotTransportAdapter } from './transport/copilot.js'
 import { GitHubAccountTokenClient } from './auth/github-account.js'
 import { MemoryProviderCredentialStore } from './credentials/credential-store.js'
@@ -44,71 +43,6 @@ describe('openfox-github-copilot plugin', () => {
   })
 })
 
-describe('getDefaultModels', () => {
-  it('returns all 21 models with a positive contextWindow', () => {
-    const models = getDefaultModels()
-    expect(models.length).toBe(21)
-    for (const m of models) {
-      expect(m.contextWindow).toBeGreaterThan(0)
-      expect(m.source).toBe('default')
-    }
-  })
-
-  it('includes key models with expected context sizes', () => {
-    const models = getDefaultModels()
-    const byId = new Map(models.map(m => [m.id, m]))
-
-    // Chat completion models (real API values)
-    expect(byId.get('gpt-5-mini')?.contextWindow).toBe(128000)
-    expect(byId.get('gpt-5.4')?.contextWindow).toBe(272000)
-    expect(byId.get('gpt-5.4-nano')?.contextWindow).toBe(200000)
-
-    // Claude (real API values)
-    expect(byId.get('claude-fable-5')?.contextWindow).toBe(200000)
-    expect(byId.get('claude-haiku-4.5')?.contextWindow).toBe(136000)
-    expect(byId.get('claude-opus-4.5')?.contextWindow).toBe(168000)
-    expect(byId.get('claude-opus-4.6')?.contextWindow).toBe(200000)
-    expect(byId.get('claude-opus-4.7')?.contextWindow).toBe(200000)
-    expect(byId.get('claude-opus-4.8')?.contextWindow).toBe(200000)
-    expect(byId.get('claude-sonnet-4.5')?.contextWindow).toBe(168000)
-    expect(byId.get('claude-sonnet-4.6')?.contextWindow).toBe(200000)
-    expect(byId.get('claude-sonnet-5')?.contextWindow).toBe(200000)
-
-    // Gemini
-    expect(byId.get('gemini-3.1-pro')?.contextWindow).toBe(200000)
-    expect(byId.get('gemini-3.5-flash')?.contextWindow).toBe(200000)
-
-    // Trajectory compaction
-    expect(byId.get('trajectory-compaction')?.contextWindow).toBe(245760)
-
-    // Responses endpoint models
-    expect(byId.get('gpt-5.3-codex')?.contextWindow).toBe(272000)
-    expect(byId.get('gpt-5.4-mini')?.contextWindow).toBe(272000)
-    expect(byId.get('gpt-5.5')?.contextWindow).toBe(272000)
-    expect(byId.get('gpt-5.6-luna')?.contextWindow).toBe(200000)
-    expect(byId.get('gpt-5.6-sol')?.contextWindow).toBe(272000)
-    expect(byId.get('gpt-5.6-terra')?.contextWindow).toBe(272000)
-
-    // Responses models should have requestBody.endpoint
-    for (const id of ['gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.5', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']) {
-      expect(byId.get(id)?.requestBody?.endpoint).toBe('/responses')
-    }
-
-    // Chat models should NOT have requestBody.endpoint
-    for (const id of ['gpt-5-mini', 'gpt-5.4', 'claude-sonnet-4.6', 'gemini-3.5-flash']) {
-      expect(byId.get(id)?.requestBody?.endpoint).toBeUndefined()
-    }
-
-    // Retired / unknown models removed
-    expect(byId.has('gpt-5.2')).toBe(false)
-    expect(byId.has('gemini-2.5-pro')).toBe(false)
-    expect(byId.has('gemini-3-flash')).toBe(false)
-    expect(byId.has('mai-code-1-flash')).toBe(false)
-    expect(byId.has('raptor-mini')).toBe(false)
-    expect(byId.has('kimi-k2.7-code')).toBe(false)
-  })
-})
-
 describe('GitHubCopilotTransportAdapter.listModels', () => {
   let adapter: GitHubCopilotTransportAdapter
 
@@ -125,18 +59,18 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
     mockFetch.mockReset()
   })
 
-  it('returns defaults when there is no credentialRef', async () => {
+  it('returns empty models when there is no credentialRef and cache is empty', async () => {
     const models = await adapter.listModels(makeContext(undefined))
-    expect(models.length).toBe(21)
+    expect(models.length).toBe(0)
     expect(mockFetch).not.toHaveBeenCalled()
   })
 
-  it('returns defaults when credentialRef is an empty string', async () => {
+  it('returns empty models when credentialRef is an empty string and cache is empty', async () => {
     const models = await adapter.listModels(makeContext(''))
-    expect(models.length).toBe(21)
+    expect(models.length).toBe(0)
   })
 
-  it('uses /models max_prompt_tokens as the primary contextWindow', async () => {
+  it('uses /models max_context_window_tokens as the primary contextWindow', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -151,11 +85,11 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
     })
     const models = await adapter.listModels(makeContext('cred'))
     const claude = models.find(m => m.id === 'claude-sonnet-4.5')
-    expect(claude?.contextWindow).toBe(180000)
+    expect(claude?.contextWindow).toBe(200000)
     expect(claude?.source).toBe('backend')
   })
 
-  it('falls back to max_context_window_tokens when max_prompt_tokens is absent from /models', async () => {
+  it('falls back to max_prompt_tokens when max_context_window_tokens is absent from /models', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -163,7 +97,7 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
           {
             id: 'gpt-5-mini',
             supported_endpoints: ['/chat/completions'],
-            capabilities: { type: 'chat', limits: { max_context_window_tokens: 400000 } },
+            capabilities: { type: 'chat', limits: { max_prompt_tokens: 400000 } },
           },
         ],
       }),
@@ -171,6 +105,128 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
     const models = await adapter.listModels(makeContext('cred'))
     const gpt5 = models.find(m => m.id === 'gpt-5-mini')
     expect(gpt5?.contextWindow).toBe(400000)
+  })
+
+  it('reads supportsVision from capabilities.supports.vision', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'vision-model',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', supports: { vision: true } },
+          },
+          {
+            id: 'no-vision-model',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', supports: { vision: false } },
+          },
+          {
+            id: 'unspecified-vision-model',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat' },
+          },
+        ],
+      }),
+    })
+    const models = await adapter.listModels(makeContext('cred'))
+    expect(models.find(m => m.id === 'vision-model')?.supportsVision).toBe(true)
+    expect(models.find(m => m.id === 'no-vision-model')?.supportsVision).toBe(false)
+    expect(models.find(m => m.id === 'unspecified-vision-model')?.supportsVision).toBeUndefined()
+  })
+
+  it('reads reasoningEfforts from capabilities.supports.reasoning_effort', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'reasoning-model',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', supports: { reasoning_effort: ['none', 'low', 'medium', 'high', 'xhigh'] } },
+          },
+          {
+            id: 'plain-model',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat' },
+          },
+        ],
+      }),
+    })
+    const models = await adapter.listModels(makeContext('cred'))
+    expect(models.find(m => m.id === 'reasoning-model')?.reasoningEfforts).toEqual([
+      'none',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ])
+    expect(models.find(m => m.id === 'plain-model')?.reasoningEfforts).toBeUndefined()
+  })
+
+  it('sets contextWindow to 1M for extended-capability models', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'claude-sonnet-4.6',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 264000 } },
+          },
+          {
+            id: 'gpt-5.5',
+            supported_endpoints: ['/responses'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 400000 } },
+          },
+          {
+            id: 'gemini-3.1-pro',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 264000 } },
+          },
+          {
+            id: 'gemini-3.1-pro-preview',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 264000 } },
+          },
+          {
+            id: 'gemini-3.6-flash',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 264000 } },
+          },
+        ],
+      }),
+    })
+    const models = await adapter.listModels(makeContext('cred'))
+    expect(models.find(m => m.id === 'claude-sonnet-4.6')?.contextWindow).toBe(1_000_000)
+    expect(models.find(m => m.id === 'gpt-5.5')?.contextWindow).toBe(1_000_000)
+    expect(models.find(m => m.id === 'gemini-3.1-pro')?.contextWindow).toBe(1_000_000)
+    expect(models.find(m => m.id === 'gemini-3.1-pro-preview')?.contextWindow).toBe(1_000_000)
+    expect(models.find(m => m.id === 'gemini-3.6-flash')?.contextWindow).toBe(1_000_000)
+  })
+
+  it('keeps max_context_window_tokens for non-extended models', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'claude-sonnet-4.5',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 200000 } },
+          },
+          {
+            id: 'gpt-5-mini',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 264000 } },
+          },
+        ],
+      }),
+    })
+    const models = await adapter.listModels(makeContext('cred'))
+    expect(models.find(m => m.id === 'claude-sonnet-4.5')?.contextWindow).toBe(200000)
+    expect(models.find(m => m.id === 'gpt-5-mini')?.contextWindow).toBe(264000)
   })
 
   it('handles /models with capabilities.limits as null or missing', async () => {
@@ -207,7 +263,8 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
     expect(models.find(m => m.id === 'no-cap-model')).toBeUndefined()
   })
 
-  it('merges /models results with defaults, preferring API', async () => {
+  it('caches API models and serves them from cache when the API later fails', async () => {
+    // First call: API returns models -> cached
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -220,12 +277,16 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
         ],
       }),
     })
-    const models = await adapter.listModels(makeContext('cred'))
-    expect(models.length).toBe(21)
-    const gpt5 = models.find(m => m.id === 'gpt-5-mini')
-    expect(gpt5?.contextWindow).toBe(99999)
-    const claude = models.find(m => m.id === 'claude-sonnet-4.5')
-    expect(claude?.contextWindow).toBe(168000)
+    const first = await adapter.listModels(makeContext('cred'))
+    expect(first.length).toBe(1)
+    expect(first[0]?.contextWindow).toBe(99999)
+
+    // Second call: API + catalog both fail -> served from cache
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 500 })
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 500 })
+    const second = await adapter.listModels(makeContext('cred'))
+    expect(second.length).toBe(1)
+    expect(second[0]?.contextWindow).toBe(99999)
   })
 
   it('uses GitHub Catalog as fallback when /models returns nothing', async () => {
@@ -272,29 +333,26 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
     expect(models.find(m => m.id === 'null-limits-model')?.contextWindow).toBe(200000)
   })
 
-  it('falls back to defaults when both /models and GitHub Catalog fail', async () => {
+  it('returns empty when both /models and GitHub Catalog fail and cache is empty', async () => {
     mockFetch.mockRejectedValue(new Error('network error'))
     const models = await adapter.listModels(makeContext('cred'))
-    expect(models.length).toBe(21)
-    for (const m of models) {
-      expect(m.source).toBe('default')
-    }
+    expect(models.length).toBe(0)
   })
 
-  it('falls back to defaults when /models returns nothing and catalog returns malformed', async () => {
+  it('returns empty when /models returns nothing and catalog returns malformed, and cache is empty', async () => {
     mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ invalid: true }) })
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ wrapped: true }),
     })
     const models = await adapter.listModels(makeContext('cred'))
-    expect(models.length).toBe(21)
+    expect(models.length).toBe(0)
   })
 
-  it('falls back to defaults when access context fails', async () => {
+  it('returns empty when access context fails and cache is empty', async () => {
     mockAuth.getAccessContext.mockRejectedValue(new Error('no token'))
     const models = await adapter.listModels(makeContext('cred'))
-    expect(models.length).toBe(21)
+    expect(models.length).toBe(0)
     expect(mockFetch).not.toHaveBeenCalled()
   })
 })
@@ -309,6 +367,10 @@ describe('GitHubCopilotTransportAdapter — items from spec', () => {
     })
     mockAuth.getOAuthToken.mockResolvedValue('test-oauth-token')
     adapter = new GitHubCopilotTransportAdapter(mockAuth as any)
+    // These spec tests exercise the /responses transport directly; the real
+    // runtime populates modelEndpoints via listModels. Pre-seed it for the
+    // responses-only model they use so routing resolves to /responses.
+    ;(adapter as any).modelEndpoints.set('gpt-5.4-mini', '/responses')
   })
 
   afterEach(() => {
