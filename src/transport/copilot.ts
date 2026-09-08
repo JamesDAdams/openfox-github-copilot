@@ -11,33 +11,11 @@ import type {
   LLMToolDefinition,
 } from 'openfox/provider'
 import { GitHubCopilotAuthAdapter } from '../auth/github-browser-auth.js'
+import { GitHubCopilotPricingFetcher } from './pricing-fetcher.js'
+import type { PricingUnit } from '../settings.js'
 const GITHUB_CATALOG_API = 'https://models.github.ai/catalog/models'
 
 const LOOKAROUND_RE = /\(\?[=!]|\(\?<[=!]/
-
-// Models that advertise an extended (1 million token) context window. The
-// /models endpoint does not surface this capability, so we mirror the curated
-// list from GitHub's "Models with extended capabilities" docs.
-const EXTENDED_CONTEXT_MODELS = new Set([
-  'claude-sonnet-4.6',
-  'claude-opus-4.6',
-  'claude-opus-4.7',
-  'claude-opus-4.8',
-  'claude-opus-5',
-  'claude-sonnet-5',
-  'gpt-5.3-codex',
-  'gpt-5.4',
-  'gpt-5.5',
-  'gpt-5.6-luna',
-  'gpt-5.6-sol',
-  'gpt-5.6-terra',
-  'kimi-k3',
-  // Gemini models have a native 1M context window even though Copilot's CAPI
-  // advertises a lower max_context_window_tokens (264000).
-  'gemini-3.1-pro',
-  'gemini-3.1-pro-preview',
-  'gemini-3.6-flash',
-])
 
 function isAuthHttpError(error: string): boolean {
   if (/ \(40[13]\):/.test(error)) return true
@@ -72,10 +50,91 @@ function sanitizeSchema(obj: unknown): unknown {
   return obj
 }
 
+export interface ModelPricing {
+  input?: number
+  output?: number
+  cacheRead?: number
+  cacheWrite?: number
+  currency?: 'usd' | 'eur' | 'tokens'
+}
+
+function parsePricing(m: any): ModelPricing | undefined {
+  if (!m || typeof m !== 'object') return undefined
+
+  // 1. Check for Copilot CAPI billing structure: m.billing.token_prices
+  const tokenPrices = m.billing?.token_prices
+  if (tokenPrices && typeof tokenPrices === 'object') {
+    const prices = typeof tokenPrices.default === 'object' && tokenPrices.default !== null
+      ? tokenPrices.default
+      : tokenPrices
+
+    const input = prices.input_price ?? prices.input ?? prices.prompt
+    const output = prices.output_price ?? prices.output ?? prices.completion
+    const cacheRead = prices.cache_read_price ?? prices.cache_price ?? prices.cacheRead ?? prices.cache_read
+    const cacheWrite = prices.cache_write_price ?? prices.cacheWrite ?? prices.cache_write
+
+    const result: ModelPricing = {}
+    if (typeof input === 'number') result.input = input
+    if (typeof output === 'number') result.output = output
+    if (typeof cacheRead === 'number') result.cacheRead = cacheRead
+    if (typeof cacheWrite === 'number') result.cacheWrite = cacheWrite
+    if (Object.keys(result).length > 0) return result
+  }
+
+  // 2. Generic pricing / billing / capabilities fallback
+  const pricingObj = m.pricing?.token
+    ?? m.pricing?.tokens
+    ?? m.pricing?.per_million_tokens
+    ?? m.pricing
+    ?? m.billing?.token
+    ?? m.billing
+    ?? m.cost?.token
+    ?? m.cost
+    ?? m.capabilities?.pricing
+
+  if (pricingObj && typeof pricingObj === 'object') {
+    const input = pricingObj.input_price ?? pricingObj.input ?? pricingObj.input_tokens ?? pricingObj.prompt ?? pricingObj.prompt_tokens
+    const output = pricingObj.output_price ?? pricingObj.output ?? pricingObj.output_tokens ?? pricingObj.completion ?? pricingObj.completion_tokens
+    const cacheRead = pricingObj.cache_read_price ?? pricingObj.cache_price ?? pricingObj.cache_read ?? pricingObj.cacheRead ?? pricingObj.cache_read_tokens
+    const cacheWrite = pricingObj.cache_write_price ?? pricingObj.cache_write ?? pricingObj.cacheWrite ?? pricingObj.cache_write_tokens
+
+    const result: ModelPricing = {}
+    if (typeof input === 'number') result.input = input
+    if (typeof output === 'number') result.output = output
+    if (typeof cacheRead === 'number') result.cacheRead = cacheRead
+    if (typeof cacheWrite === 'number') result.cacheWrite = cacheWrite
+
+    if (Object.keys(result).length > 0) return result
+  }
+
+  return undefined
+}
+
 export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
   readonly id = 'github-copilot-transport'
+  private cachedModels: ModelConfig[] = []
+  private readonly modelEndpoints = new Map<string, string>()
+  private readonly pricingFetcher: GitHubCopilotPricingFetcher
+  private pricingUnit: PricingUnit = 'credits'
 
-  constructor(private readonly auth: GitHubCopilotAuthAdapter) {}
+  constructor(
+    private readonly auth: GitHubCopilotAuthAdapter,
+    options?: {
+      pricingFetcher?: GitHubCopilotPricingFetcher
+      pricingUnit?: PricingUnit
+    },
+  ) {
+    this.pricingFetcher = options?.pricingFetcher ?? new GitHubCopilotPricingFetcher()
+    if (options?.pricingUnit) this.pricingUnit = options.pricingUnit
+  }
+
+  setPricingUnit(unit: PricingUnit): void {
+    this.pricingUnit = unit
+  }
+
+  getPricingFetcher(): GitHubCopilotPricingFetcher {
+    return this.pricingFetcher
+  }
 
   private async fetchGitHubCatalog(credentialRef: string): Promise<ModelConfig[]> {
     try {
@@ -101,13 +160,18 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
 
       if (!Array.isArray(data)) return []
 
-      return data.map((m) => ({
-        id: m.id.includes('/') ? m.id.slice(m.id.indexOf('/') + 1) : m.id,
-        name: m.name ?? m.id,
-        contextWindow: m.limits?.max_input_tokens ?? 200000,
-        source: 'backend' as const,
-        requestBody: { endpoint: '/chat/completions' },
-      }))
+      return data.map((m) => {
+        const id = m.id.includes('/') ? m.id.slice(m.id.indexOf('/') + 1) : m.id
+        const pricing = parsePricing({ ...m, id })
+        return {
+          id,
+          name: m.name ?? id,
+          contextWindow: m.limits?.max_input_tokens ?? 200000,
+          source: 'backend' as const,
+          requestBody: { endpoint: '/chat/completions' },
+          ...(pricing ? { pricing } : {}),
+        }
+      })
     } catch {
       return []
     }
@@ -142,6 +206,9 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
   private async fetchCopilotModels(headers: Record<string, string>): Promise<ModelConfig[]> {
     this.modelEndpoints.clear()
     try {
+      // Ensure prices are fetched from the remote table first
+      await this.pricingFetcher.fetchPricing().catch(() => {})
+
       const res = await fetch('https://api.githubcopilot.com/models', {
         headers: { ...headers },
         signal: AbortSignal.timeout(5000),
@@ -149,23 +216,35 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
 
       if (!res.ok) return []
 
-      const data = await res.json() as {
-        data?: Array<{
-          id: string
-          name?: string
-          capabilities?: {
-            type?: string
-            limits?: { max_prompt_tokens?: number; max_context_window_tokens?: number; max_output_tokens?: number }
-            supports?: { vision?: boolean; reasoning_effort?: string[] }
+      const json = await res.json() as
+        | Array<{
+            id: string
+            name?: string
+            capabilities?: {
+              type?: string
+              limits?: { max_prompt_tokens?: number; max_context_window_tokens?: number; max_output_tokens?: number }
+              supports?: { vision?: boolean; reasoning_effort?: string[] }
+            }
+            supported_endpoints?: string[]
+          }>
+        | {
+            data?: Array<{
+              id: string
+              name?: string
+              capabilities?: {
+                type?: string
+                limits?: { max_prompt_tokens?: number; max_context_window_tokens?: number; max_output_tokens?: number }
+                supports?: { vision?: boolean; reasoning_effort?: string[] }
+              }
+              supported_endpoints?: string[]
+            }>
           }
-          supported_endpoints?: string[]
-        }>
-      }
 
-      if (!data.data || !Array.isArray(data.data)) return []
+      const rawList = Array.isArray(json) ? json : json.data
+      if (!rawList || !Array.isArray(rawList)) return []
 
       const models: ModelConfig[] = []
-      for (const m of data.data) {
+      for (const m of rawList) {
         if (m.capabilities?.type !== 'chat') continue
         const endpoints = m.supported_endpoints ?? []
         const hasChat = endpoints.includes('/chat/completions')
@@ -178,24 +257,54 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
 
         const limits = m.capabilities?.limits
         const supports = m.capabilities?.supports
-        const mc: ModelConfig = {
+        
+        // Dynamically fetched pricing according to configured pricingUnit
+        const dynamicPricing = this.pricingFetcher.getPricing(m.id, 'Default', this.pricingUnit)
+        const pricing = dynamicPricing ?? parsePricing(m)
+
+        const defaultContextWindow = limits?.max_context_window_tokens
+          ?? limits?.max_prompt_tokens
+          ?? 128000
+
+        const mc: ModelConfig & { pricing?: ModelPricing } = {
           id: m.id,
           name: m.name || m.id,
-          contextWindow: EXTENDED_CONTEXT_MODELS.has(m.id)
-            ? 1_000_000
-            : limits?.max_context_window_tokens
-              ?? limits?.max_prompt_tokens
-              ?? 128000,
+          contextWindow: defaultContextWindow,
           source: 'backend',
           ...(supports?.vision !== undefined && { supportsVision: supports.vision }),
           ...(Array.isArray(supports?.reasoning_effort) && supports.reasoning_effort.length
             ? { reasoningEfforts: supports.reasoning_effort }
             : {}),
+          ...(pricing ? { pricing } : {}),
         }
         if (!hasChat && hasResponses) {
           mc.requestBody = { endpoint: '/responses' }
         }
         models.push(mc)
+
+        // If model supports extended 1M context, also project the 1M variant
+        if (this.pricingFetcher.hasLongContextSupport(m.id)) {
+          const longPricing = this.pricingFetcher.getPricing(m.id, 'Long context', this.pricingUnit) ?? pricing
+          const longVariant: ModelConfig & { pricing?: ModelPricing } = {
+            id: `${m.id}-1m`,
+            name: `${m.name || m.id} (1M context)`,
+            apiModelId: m.id,
+            contextWindow: 1_000_000,
+            source: 'backend',
+            ...(supports?.vision !== undefined && { supportsVision: supports.vision }),
+            ...(Array.isArray(supports?.reasoning_effort) && supports.reasoning_effort.length
+              ? { reasoningEfforts: supports.reasoning_effort }
+              : {}),
+            ...(longPricing ? { pricing: longPricing } : {}),
+          }
+          if (!hasChat && hasResponses) {
+            longVariant.requestBody = { endpoint: '/responses' }
+          }
+          if (!hasChat && hasResponses) {
+            this.modelEndpoints.set(longVariant.id, '/responses')
+          }
+          models.push(longVariant)
+        }
       }
       return models
     } catch {
@@ -219,8 +328,10 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
       return
     }
 
-    const model = context.model || 'gpt-5-mini'
-    const endpoint = this.getModelEndpoint(model)
+    const rawModel = context.model || 'gpt-5-mini'
+    const cached = this.cachedModels.find(m => m.id === rawModel)
+    const model = cached?.apiModelId || rawModel
+    const endpoint = this.getModelEndpoint(rawModel)
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       const retrySignal = new AbortController()
@@ -280,11 +391,12 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
     if (known === '/responses') return '/responses'
     const cached = this.cachedModels.find(m => m.id === modelId)
     if (cached?.requestBody?.endpoint === '/responses') return '/responses'
+    if (cached?.apiModelId) {
+      const parentKnown = this.modelEndpoints.get(cached.apiModelId)
+      if (parentKnown === '/responses') return '/responses'
+    }
     return '/chat/completions'
   }
-
-  private readonly modelEndpoints = new Map<string, string>()
-  private cachedModels: ModelConfig[] = []
 
   private async *streamChatCompletions(
     request: LLMCompletionRequest,

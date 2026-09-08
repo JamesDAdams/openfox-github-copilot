@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { ProviderPluginRegistry } from 'openfox/provider'
 import { register } from './index.js'
 import { GitHubCopilotTransportAdapter } from './transport/copilot.js'
+import { GitHubCopilotPricingFetcher } from './transport/pricing-fetcher.js'
 import { GitHubAccountTokenClient } from './auth/github-account.js'
 import { MemoryProviderCredentialStore } from './credentials/credential-store.js'
 import { GitHubCopilotAuthAdapter } from './auth/github-browser-auth.js'
@@ -41,6 +42,65 @@ describe('openfox-github-copilot plugin', () => {
     expect(registry.registerTransport).toHaveBeenCalledWith(expect.objectContaining({ id: 'github-copilot-transport' }))
     expect(registry.registerPreset).toHaveBeenCalledWith(expect.objectContaining({ id: 'github-copilot' }))
   })
+
+  it('registers a quota provider when registerQuotaProvider is available', async () => {
+    const configDirectory = await mkdtemp(join(tmpdir(), 'openfox-github-copilot-'))
+    const registry: ProviderPluginRegistry = {
+      runtime: { mode: 'production', configDirectory },
+      registerAuth: vi.fn(),
+      registerTransport: vi.fn(),
+      registerPreset: vi.fn(),
+      registerQuotaProvider: vi.fn(),
+    }
+    await register(registry)
+    expect(registry.registerQuotaProvider).toHaveBeenCalledWith(expect.objectContaining({ id: 'github-copilot' }))
+  })
+
+  it('registers settings when registerSettings is available', async () => {
+    const configDirectory = await mkdtemp(join(tmpdir(), 'openfox-github-copilot-'))
+    const registerSettings = vi.fn()
+    const registry: ProviderPluginRegistry = {
+      runtime: { mode: 'production', configDirectory },
+      registerAuth: vi.fn(),
+      registerTransport: vi.fn(),
+      registerPreset: vi.fn(),
+      registerSettings,
+    } as any
+    await register(registry)
+    expect(registerSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'GitHub Copilot Configuration',
+        fields: expect.arrayContaining([
+          expect.objectContaining({ key: 'modelsRefreshIntervalMinutes' }),
+          expect.objectContaining({ key: 'pricesRefreshIntervalMinutes' }),
+          expect.objectContaining({ key: 'notifyOnPriceChanges' }),
+          expect.objectContaining({ key: 'manualSync' }),
+        ]),
+      }),
+    )
+
+    const spec = registerSettings.mock.calls[0][0]
+    const initialSettings = await spec.getSettings()
+    expect(initialSettings.pricesRefreshIntervalMinutes).toBe(60)
+
+    await spec.saveSettings({ pricesRefreshIntervalMinutes: 120 })
+    const updatedSettings = await spec.getSettings()
+    expect(updatedSettings.pricesRefreshIntervalMinutes).toBe(120)
+
+    const actionResult = await spec.executeAction('manualSync')
+    expect(actionResult?.message).toContain('Sync complete')
+  })
+
+  it('does not throw when registerQuotaProvider is absent (older OpenFox builds)', async () => {
+    const configDirectory = await mkdtemp(join(tmpdir(), 'openfox-github-copilot-'))
+    const registry: ProviderPluginRegistry = {
+      runtime: { mode: 'production', configDirectory },
+      registerAuth: vi.fn(),
+      registerTransport: vi.fn(),
+      registerPreset: vi.fn(),
+    }
+    await expect(register(registry)).resolves.toBeUndefined()
+  })
 })
 
 describe('GitHubCopilotTransportAdapter.listModels', () => {
@@ -52,7 +112,16 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
       headers: { Authorization: 'Bearer test-copilot-token' },
     })
     mockAuth.getOAuthToken.mockResolvedValue('test-oauth-token')
-    adapter = new GitHubCopilotTransportAdapter(mockAuth as any)
+    const noopFetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('models-and-pricing.yml') || url.includes('supported-models.md')) {
+        return { ok: false }
+      }
+      return mockFetch(url)
+    })
+    const pricingFetcher = new GitHubCopilotPricingFetcher(noopFetch as any)
+    adapter = new GitHubCopilotTransportAdapter(mockAuth as any, {
+      pricingFetcher,
+    })
   })
 
   afterEach(() => {
@@ -165,7 +234,118 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
     expect(models.find(m => m.id === 'plain-model')?.reasoningEfforts).toBeUndefined()
   })
 
-  it('sets contextWindow to 1M for extended-capability models', async () => {
+  it('parses Copilot CAPI billing.token_prices structure accurately', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'claude-sonnet-5',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat' },
+            billing: {
+              token_prices: {
+                batch_size: 1000,
+                default: {
+                  input_price: 200,
+                  output_price: 1000,
+                  cache_read_price: 20,
+                  cache_write_price: 250,
+                  max_prompt_tokens: 200000,
+                },
+              },
+            },
+          },
+          {
+            id: 'gpt-5.4-mini',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat' },
+            billing: {
+              token_prices: {
+                input_price: 15,
+                output_price: 60,
+                cache_price: 7.5,
+              },
+            },
+          },
+        ],
+      }),
+    })
+    const models = (await adapter.listModels(makeContext('cred'))) as any[]
+    const claude = models.find((m) => m.id === 'claude-sonnet-5')
+    expect(claude?.pricing).toEqual({
+      currency: 'tokens',
+      input: 200,
+      output: 1000,
+      cacheRead: 20,
+      cacheWrite: 250,
+    })
+
+    const gpt = models.find((m) => m.id === 'gpt-5.4-mini')
+    expect(gpt?.pricing).toEqual({
+      currency: 'tokens',
+      input: 75,
+      output: 450,
+      cacheRead: 7.5,
+    })
+  })
+
+  it('parses generic model pricing and token costs from /models response', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'claude-sonnet-5',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat' },
+            pricing: {
+              token: {
+                input: 200,
+                output: 1000,
+                cache_read: 20,
+                cache_write: 250,
+              },
+            },
+          },
+          {
+            id: 'custom-gpt-model',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat' },
+            pricing: {
+              input_tokens: 150,
+              output_tokens: 600,
+            },
+          },
+          {
+            id: 'free-model',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat' },
+          },
+        ],
+      }),
+    })
+    const models = await adapter.listModels(makeContext('cred')) as any[]
+    const claude = models.find(m => m.id === 'claude-sonnet-5')
+    expect(claude?.pricing).toEqual({
+      currency: 'tokens',
+      input: 200,
+      output: 1000,
+      cacheRead: 20,
+      cacheWrite: 250,
+    })
+
+    const custom = models.find(m => m.id === 'custom-gpt-model')
+    expect(custom?.pricing).toEqual({
+      input: 150,
+      output: 600,
+    })
+
+    const freeModel = models.find(m => m.id === 'free-model')
+    expect(freeModel?.pricing).toBeUndefined()
+  })
+
+  it('uses API limits for base models and creates 1M variants for extended-capability models', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -199,11 +379,12 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
       }),
     })
     const models = await adapter.listModels(makeContext('cred'))
-    expect(models.find(m => m.id === 'claude-sonnet-4.6')?.contextWindow).toBe(1_000_000)
-    expect(models.find(m => m.id === 'gpt-5.5')?.contextWindow).toBe(1_000_000)
-    expect(models.find(m => m.id === 'gemini-3.1-pro')?.contextWindow).toBe(1_000_000)
-    expect(models.find(m => m.id === 'gemini-3.1-pro-preview')?.contextWindow).toBe(1_000_000)
-    expect(models.find(m => m.id === 'gemini-3.6-flash')?.contextWindow).toBe(1_000_000)
+    expect(models.find(m => m.id === 'claude-sonnet-4.6')?.contextWindow).toBe(264000)
+    expect(models.find(m => m.id === 'claude-sonnet-4.6-1m')?.contextWindow).toBe(1_000_000)
+    expect(models.find(m => m.id === 'claude-sonnet-4.6-1m')?.apiModelId).toBe('claude-sonnet-4.6')
+    expect(models.find(m => m.id === 'gpt-5.5')?.contextWindow).toBe(400000)
+    expect(models.find(m => m.id === 'gpt-5.5-1m')?.contextWindow).toBe(1_000_000)
+    expect(models.find(m => m.id === 'gpt-5.5-1m')?.apiModelId).toBe('gpt-5.5')
   })
 
   it('keeps max_context_window_tokens for non-extended models', async () => {
@@ -366,7 +547,16 @@ describe('GitHubCopilotTransportAdapter — items from spec', () => {
       headers: { Authorization: 'Bearer test-copilot-token' },
     })
     mockAuth.getOAuthToken.mockResolvedValue('test-oauth-token')
-    adapter = new GitHubCopilotTransportAdapter(mockAuth as any)
+    const noopFetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('models-and-pricing.yml') || url.includes('supported-models.md')) {
+        return { ok: false }
+      }
+      return mockFetch(url)
+    })
+    const pricingFetcher = new GitHubCopilotPricingFetcher(noopFetch as any)
+    adapter = new GitHubCopilotTransportAdapter(mockAuth as any, {
+      pricingFetcher,
+    })
     // These spec tests exercise the /responses transport directly; the real
     // runtime populates modelEndpoints via listModels. Pre-seed it for the
     // responses-only model they use so routing resolves to /responses.
