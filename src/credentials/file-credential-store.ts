@@ -47,6 +47,11 @@ export class FileProviderCredentialStore implements ProviderCredentialStore {
     await this.save(data)
   }
 
+  async listReferences(): Promise<string[]> {
+    const data = await this.load()
+    return Object.keys(data.credentials)
+  }
+
   private async load(): Promise<CredentialFile> {
     try {
       return JSON.parse(await readFile(this.path, 'utf8')) as CredentialFile

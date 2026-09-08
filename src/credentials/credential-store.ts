@@ -3,6 +3,7 @@ export interface ProviderCredentialStore {
   get(reference: string): Promise<unknown | undefined>
   set(reference: string, credential: unknown): Promise<void>
   delete(reference: string): Promise<void>
+  listReferences(): Promise<string[]>
 }
 
 export class MemoryProviderCredentialStore implements ProviderCredentialStore {
@@ -26,5 +27,9 @@ export class MemoryProviderCredentialStore implements ProviderCredentialStore {
 
   async delete(reference: string): Promise<void> {
     this.credentials.delete(reference)
+  }
+
+  async listReferences(): Promise<string[]> {
+    return [...this.credentials.keys()]
   }
 }
