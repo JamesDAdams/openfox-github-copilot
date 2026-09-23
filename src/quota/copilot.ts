@@ -341,6 +341,9 @@ export class GitHubCopilotQuotaProvider implements QuotaProvider {
     if (registry && typeof registry.registerQuotaProvider === 'function') {
       registry.registerQuotaProvider(this)
     }
+
+    // 4. Eagerly sync quota sources with openfox-quota so data appears immediately without reload
+    void this.getQuota().catch(() => {})
   }
 
   private submitSourcesToGlobalManager(
