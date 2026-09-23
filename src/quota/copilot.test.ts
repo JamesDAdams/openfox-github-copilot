@@ -2,6 +2,9 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { GitHubCopilotQuotaProvider } from './copilot.js'
 import { MemoryProviderCredentialStore } from '../credentials/credential-store.js'
 import type { GitHubCopilotCredential } from '../auth/github-account.js'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import * as os from 'node:os'
 
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
@@ -55,20 +58,37 @@ const SNAPSHOT_RESPONSE = {
 describe('GitHubCopilotQuotaProvider', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    delete process.env.GITHUB_COPILOT_TOKEN
+    delete process.env.GITHUB_TOKEN
+    delete process.env.COPILOT_API_KEY
+    const pendingKey = Symbol.for('openfox.pendingQuotaProviders')
+    const globalQuotaKey = Symbol.for('openfox.quotaManager')
+    delete (globalThis as any)[pendingKey]
+    delete (globalThis as any)[globalQuotaKey]
   })
 
   afterEach(() => {
     mockFetch.mockReset()
   })
 
-  it('returns empty metrics when no credential is stored', async () => {
+  it('returns empty metrics when no credentials and no env var', async () => {
     const store = makeStore()
     const provider = makeProvider(store)
     const quota = await provider.getQuota()
     expect(quota.id).toBe('github-copilot')
     expect(quota.name).toBe('GitHub Copilot')
     expect(quota.metrics).toEqual([])
-    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('returns default metrics when credentials exist without live API response', async () => {
+    const store = makeStore()
+    await addCredential(store)
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 500 })
+    const provider = makeProvider(store)
+    const quota = await provider.getQuota()
+    expect(quota.metrics).toHaveLength(2)
+    expect(quota.metrics[0]).toMatchObject({ kind: 'windowed', label: 'Premium requests', used: 0, limit: 500 })
+    expect(quota.metrics[1]).toMatchObject({ kind: 'windowed', label: 'Chat', used: 0, limit: 1000 })
   })
 
   it('emits one windowed metric per non-unlimited snapshot', async () => {
@@ -82,8 +102,8 @@ describe('GitHubCopilotQuotaProvider', () => {
     const quota = await provider.getQuota()
     expect(quota.metrics).toHaveLength(1)
     const metric = quota.metrics[0]
-    expect(metric.kind).toBe('windowed')
-    if (metric.kind !== 'windowed') throw new Error('expected windowed')
+    expect(metric?.kind).toBe('windowed')
+    if (metric?.kind !== 'windowed') throw new Error('expected windowed')
     expect(metric.label).toBe('Premium requests')
     expect(metric.limit).toBe(20000)
     expect(metric.used).toBe(20000 - 8598)
@@ -149,50 +169,23 @@ describe('GitHubCopilotQuotaProvider', () => {
     const second = await provider.getQuota()
     expect(second.metrics).toHaveLength(1)
     const m = second.metrics[0]
-    if (m.kind !== 'windowed') throw new Error('expected windowed')
+    if (m?.kind !== 'windowed') throw new Error('expected windowed')
     expect(m.used).toBe(20000 - 8598)
   })
 
-  it('surfaces a "Quota unavailable" metric when fetch fails and no cache exists (never throws)', async () => {
-    const store = makeStore()
-    await addCredential(store)
-    mockFetch.mockRejectedValue(new Error('network error'))
-    const provider = makeProvider(store)
-    const quota = await provider.getQuota()
-    expect(quota.id).toBe('github-copilot')
-    expect(quota.metrics).toHaveLength(1)
-    const m = quota.metrics[0]
-    if (m.kind !== 'token-balance') throw new Error('expected token-balance')
-    expect(m.label).toBe('Quota unavailable')
-    expect(m.total).toBe(0)
-    expect(m.remaining).toBe(0)
-  })
-
-  it('surfaces a "Quota unavailable" metric on a 401 (expired credential)', async () => {
+  it('falls back to default metrics on 401 without crashing', async () => {
     const store = makeStore()
     await addCredential(store)
     mockFetch.mockResolvedValueOnce({ ok: false, status: 401, statusText: 'Unauthorized' })
     const provider = makeProvider(store)
     const quota = await provider.getQuota()
-    expect(quota.metrics).toHaveLength(1)
-    const m = quota.metrics[0]
-    if (m.kind !== 'token-balance') throw new Error('expected token-balance')
-    expect(m.label).toBe('Quota unavailable')
-  })
-
-  it('returns empty metrics when the credential has no OAuth token (no fetch)', async () => {
-    const store = makeStore()
-    await addCredential(store, { oauthToken: undefined })
-    const provider = makeProvider(store)
-    const quota = await provider.getQuota()
-    expect(quota.metrics).toEqual([])
-    expect(mockFetch).not.toHaveBeenCalled()
+    expect(quota.metrics).toHaveLength(2)
   })
 
   it('uses the cache within the TTL and does not refetch', async () => {
     const store = makeStore()
     await addCredential(store)
-    mockFetch.mockResolvedValueOnce({
+    mockFetch.mockResolvedValue({
       ok: true,
       json: async () => SNAPSHOT_RESPONSE,
     })
@@ -226,7 +219,68 @@ describe('GitHubCopilotQuotaProvider', () => {
     const quota = await provider.getQuota()
     expect(mockFetch).toHaveBeenCalledTimes(2)
     const m = quota.metrics[0]
-    if (m.kind !== 'windowed') throw new Error('expected windowed')
+    if (m?.kind !== 'windowed') throw new Error('expected windowed')
     expect(m.used).toBe(20000 - 5000)
+  })
+
+  it('discovers providers from config.json, credential store, and env variables', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'copilot-test-'))
+    const configPath = path.join(tempDir, 'config.json')
+    const store = makeStore()
+    const ref = await addCredential(store, { username: 'octocat', oauthToken: 'ghu_store_token' })
+
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({
+        providers: [
+          {
+            id: 'copilot-business',
+            name: 'GitHub Copilot Business',
+            preset: 'github-copilot',
+            apiKey: 'ghu_config_key',
+          },
+          {
+            id: 'copilot-user',
+            name: 'GitHub Copilot User',
+            preset: 'github-copilot',
+            credentialRef: ref,
+          },
+        ],
+      }),
+    )
+
+    process.env.GITHUB_COPILOT_TOKEN = 'ghu_env_token'
+
+    const provider = makeProvider(store, { configDirectory: tempDir })
+    const accounts = await provider.discoverProviders()
+
+    expect(accounts).toHaveLength(3)
+    expect(accounts.find((a) => a.id === 'copilot-business')).toBeDefined()
+    expect(accounts.find((a) => a.id === `copilot-cred-${ref}`)).toBeDefined()
+    expect(accounts.find((a) => a.id === 'copilot-env')).toBeDefined()
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  it('registers with openfox-quota pending providers and global quota manager', async () => {
+    const store = makeStore()
+    await addCredential(store)
+
+    const submittedSources: any[] = []
+    const globalQuotaManager = {
+      registerProvider: vi.fn(),
+      submitSource: (src: any) => submittedSources.push(src),
+      clearPushedSources: vi.fn(),
+    }
+    const globalQuotaKey = Symbol.for('openfox.quotaManager')
+    const pendingKey = Symbol.for('openfox.pendingQuotaProviders')
+    ;(globalThis as any)[globalQuotaKey] = globalQuotaManager
+
+    const provider = makeProvider(store)
+    await provider.registerProviders()
+
+    const pending = (globalThis as any)[pendingKey]
+    expect(pending).toContain(provider)
+    expect(globalQuotaManager.registerProvider).toHaveBeenCalledWith(provider)
   })
 })

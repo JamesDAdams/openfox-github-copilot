@@ -1,15 +1,7 @@
-import 'openfox/provider'
+import type { ProviderPluginRegistry } from 'openfox/provider'
 
-// Local augmentation of the OpenFox quota contract.
-//
-// The QuotaProvider contract is defined in the OpenFox source repo
-// (src/provider/index.ts / src/shared/types.ts) but has not been published to
-// the openfox npm package yet. This module declares the shapes so the plugin
-// compiles and registers a QuotaProvider today.
-//
-// TODO(quota-contract): remove this file and import the types from 'openfox/provider'
-// once the QuotaProvider contract ships in the published openfox package. Leaving
-// it in place after that point risks type drift / duplicate declarations.
+export type LocalizedString = { en: string; fr: string }
+export type PluginRegistry = ProviderPluginRegistry
 
 export type QuotaMetric =
   | {
@@ -17,7 +9,7 @@ export type QuotaMetric =
       label: string
       used: number
       limit: number
-      window: 'hour' | 'week' | 'month'
+      window: 'hour' | 'day' | 'week' | 'month'
       model?: string
       resetsAt?: string
     }
@@ -32,17 +24,61 @@ export type QuotaMetric =
 export interface QuotaSource {
   id: string
   name: string
+  description?: string
   metrics: QuotaMetric[]
+}
+
+export interface QuotaProviderAssignment {
+  sourceId: string
+  providerId: string
+  providerName?: string
+  selectedModels?: string[]
 }
 
 export interface QuotaProvider {
   readonly id: string
   readonly name: string
-  getQuota(): Promise<QuotaSource>
+  getQuota(): Promise<QuotaSource> | QuotaSource
+}
+
+export interface PluginContext {
+  readonly id?: string
+  readonly version?: string
+  readonly runtime?: { mode: 'production' | 'development'; configDirectory: string }
+  readonly logger?: {
+    debug(message: string, context?: Record<string, unknown>): void
+    info(message: string, context?: Record<string, unknown>): void
+    warn(message: string, context?: Record<string, unknown>): void
+    error(message: string, context?: Record<string, unknown>): void
+  }
+  readonly storage?: {
+    get(key: string): unknown
+    set(key: string, value: unknown): void
+  }
+  settings?(scope?: 'global' | 'project', projectId?: string): Record<string, unknown>
+  notify?(request: {
+    title: LocalizedString
+    body?: LocalizedString
+    level?: 'info' | 'success' | 'warning' | 'error'
+    actions?: { label: LocalizedString; onActivate: any }[]
+  }): void
+  publish?(panelId: string | undefined, key: string, value: unknown): void
 }
 
 declare module 'openfox/provider' {
   interface ProviderPluginRegistry {
+    context?: PluginContext
     registerQuotaProvider?(provider: QuotaProvider): void
+    registerHook?(event: string, handler: (payload: any) => void | Promise<void>): void
+    registerRpc?(
+      method: string,
+      handler: (params: Record<string, unknown>, context: Record<string, unknown>) => unknown | Promise<unknown>,
+    ): void
+    registerTool?(tool: {
+      name: string
+      description: string
+      parameters: Record<string, unknown>
+      execute(args: Record<string, unknown>, context: Record<string, unknown>): Promise<{ success: boolean; output?: string; error?: string }>
+    }): void
   }
 }

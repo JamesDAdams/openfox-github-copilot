@@ -56,41 +56,6 @@ describe('openfox-github-copilot plugin', () => {
     expect(registry.registerQuotaProvider).toHaveBeenCalledWith(expect.objectContaining({ id: 'github-copilot' }))
   })
 
-  it('registers settings when registerSettings is available', async () => {
-    const configDirectory = await mkdtemp(join(tmpdir(), 'openfox-github-copilot-'))
-    const registerSettings = vi.fn()
-    const registry: ProviderPluginRegistry = {
-      runtime: { mode: 'production', configDirectory },
-      registerAuth: vi.fn(),
-      registerTransport: vi.fn(),
-      registerPreset: vi.fn(),
-      registerSettings,
-    } as any
-    await register(registry)
-    expect(registerSettings).toHaveBeenCalledWith(
-      expect.objectContaining({
-        title: 'GitHub Copilot Configuration',
-        fields: expect.arrayContaining([
-          expect.objectContaining({ key: 'modelsRefreshIntervalMinutes' }),
-          expect.objectContaining({ key: 'pricesRefreshIntervalMinutes' }),
-          expect.objectContaining({ key: 'notifyOnPriceChanges' }),
-          expect.objectContaining({ key: 'manualSync' }),
-        ]),
-      }),
-    )
-
-    const spec = registerSettings.mock.calls[0][0]
-    const initialSettings = await spec.getSettings()
-    expect(initialSettings.pricesRefreshIntervalMinutes).toBe(60)
-
-    await spec.saveSettings({ pricesRefreshIntervalMinutes: 120 })
-    const updatedSettings = await spec.getSettings()
-    expect(updatedSettings.pricesRefreshIntervalMinutes).toBe(120)
-
-    const actionResult = await spec.executeAction('manualSync')
-    expect(actionResult?.message).toContain('Sync complete')
-  })
-
   it('does not throw when registerQuotaProvider is absent (older OpenFox builds)', async () => {
     const configDirectory = await mkdtemp(join(tmpdir(), 'openfox-github-copilot-'))
     const registry: ProviderPluginRegistry = {
@@ -100,6 +65,104 @@ describe('openfox-github-copilot plugin', () => {
       registerPreset: vi.fn(),
     }
     await expect(register(registry)).resolves.toBeUndefined()
+  })
+
+  it('registers RPCs, quota tool, and turn.completed hook when available', async () => {
+    const configDirectory = await mkdtemp(join(tmpdir(), 'openfox-github-copilot-'))
+    const rpcs: Record<string, Function> = {}
+    let registeredTool: any
+    let registeredHook: any
+
+    const registry: any = {
+      runtime: { mode: 'production', configDirectory },
+      registerAuth: vi.fn(),
+      registerTransport: vi.fn(),
+      registerPreset: vi.fn(),
+      registerQuotaProvider: vi.fn(),
+      registerRpc: vi.fn((method, handler) => {
+        rpcs[method] = handler
+      }),
+      registerTool: vi.fn((tool) => {
+        registeredTool = tool
+      }),
+      registerHook: vi.fn((event, handler) => {
+        if (event === 'turn.completed') registeredHook = handler
+      }),
+    }
+
+    await register(registry)
+
+    expect(registry.registerRpc).toHaveBeenCalledWith('copilot.getQuota', expect.any(Function))
+    expect(registry.registerRpc).toHaveBeenCalledWith('copilot.syncQuota', expect.any(Function))
+    expect(registry.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: 'get_copilot_quota' }))
+    expect(registry.registerHook).toHaveBeenCalledWith('turn.completed', expect.any(Function))
+
+    // Test getQuota RPC
+    const quotaResult = await rpcs['copilot.getQuota']?.({})
+    expect(quotaResult?.sources).toBeDefined()
+
+    // Test syncQuota RPC
+    const syncResult = await rpcs['copilot.syncQuota']?.()
+    expect(syncResult?.success).toBe(true)
+
+    // Test manualSync RPC
+    const manualSyncResult = await rpcs['copilot.manualSync']?.()
+    expect(manualSyncResult?.success).toBe(true)
+    expect(manualSyncResult?.modelsCount).toBeDefined()
+
+    // Test tool execution
+    const toolExec = await registeredTool.execute({}, {})
+    expect(toolExec.success).toBe(true)
+    expect(toolExec.output).toContain('sources')
+
+    // Test turn.completed hook execution
+    await expect(registeredHook?.()).resolves.toBeUndefined()
+  })
+
+  it('registers settings schema with all expected options and executes settings actions', async () => {
+    const configDirectory = await mkdtemp(join(tmpdir(), 'openfox-github-copilot-'))
+    let settingsSpec: any
+
+    const registry: any = {
+      runtime: { mode: 'production', configDirectory },
+      registerAuth: vi.fn(),
+      registerTransport: vi.fn(),
+      registerPreset: vi.fn(),
+      registerSettings: vi.fn((spec) => {
+        settingsSpec = spec
+      }),
+      registerRpc: vi.fn(),
+      registerTool: vi.fn(),
+      registerHook: vi.fn(),
+    }
+
+    await register(registry)
+
+    expect(registry.registerSettings).toHaveBeenCalled()
+    expect(settingsSpec).toBeDefined()
+    expect(settingsSpec.fields).toHaveLength(9)
+
+    const fieldKeys = settingsSpec.fields.map((f: any) => f.key)
+    expect(fieldKeys).toContain('pricingUnit')
+    expect(fieldKeys).toContain('checkModelsOnStartup')
+    expect(fieldKeys).toContain('modelsRefreshIntervalMinutes')
+    expect(fieldKeys).toContain('checkPricesOnStartup')
+    expect(fieldKeys).toContain('pricesRefreshIntervalMinutes')
+    expect(fieldKeys).toContain('notifyOnNewModelsOnly')
+    expect(fieldKeys).toContain('notifyOnPriceChanges')
+    expect(fieldKeys).toContain('notifyOnEveryCheck')
+    expect(fieldKeys).toContain('manualSync')
+
+    const initial = await settingsSpec.getSettings()
+    expect(initial.checkModelsOnStartup).toBe(true)
+    expect(initial.modelsRefreshIntervalMinutes).toBe(60)
+
+    await settingsSpec.saveSettings({ modelsRefreshIntervalMinutes: 30 })
+    const updated = await settingsSpec.getSettings()
+    expect(updated.modelsRefreshIntervalMinutes).toBe(30)
+
+    const actionResult = await settingsSpec.executeAction('manualSync')
+    expect(actionResult?.message).toContain('models available')
   })
 })
 

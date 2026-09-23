@@ -4,11 +4,17 @@ import type { ProviderCredentialStore } from './credentials/credential-store.js'
 import type { GitHubCopilotTransportAdapter, ModelPricing } from './transport/copilot.js'
 import { DEFAULT_SETTINGS, type GitHubCopilotPluginSettings } from './settings.js'
 
+export interface SyncNotification {
+  title: string | { en: string; fr: string }
+  body?: string | { en: string; fr: string }
+  level?: 'info' | 'success' | 'warning' | 'error'
+}
+
 export interface SyncManagerOptions {
   auth: GitHubCopilotAuthAdapter
   credentials: ProviderCredentialStore
   transport: GitHubCopilotTransportAdapter
-  notify?: (notification: { title: string; body: string }) => void
+  notify?: (notification: SyncNotification) => void
   settings?: GitHubCopilotPluginSettings
   modelsRefreshIntervalMs?: number
   pricesRefreshIntervalMs?: number
@@ -25,7 +31,7 @@ export class GitHubCopilotSyncManager {
   private readonly auth: GitHubCopilotAuthAdapter
   private readonly credentials: ProviderCredentialStore
   private readonly transport: GitHubCopilotTransportAdapter
-  private notifier?: (notification: { title: string; body: string }) => void
+  private notifier?: (notification: SyncNotification) => void
   private settings: GitHubCopilotPluginSettings
 
   private customModelsIntervalMs?: number
@@ -53,7 +59,7 @@ export class GitHubCopilotSyncManager {
     this.customPricesIntervalMs = options.pricesRefreshIntervalMs
   }
 
-  setNotifier(notify: (notification: { title: string; body: string }) => void): void {
+  setNotifier(notify: (notification: SyncNotification) => void): void {
     this.notifier = notify
   }
 
