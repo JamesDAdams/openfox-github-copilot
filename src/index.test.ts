@@ -140,9 +140,11 @@ describe('openfox-github-copilot plugin', () => {
 
     expect(registry.registerSettings).toHaveBeenCalled()
     expect(settingsSpec).toBeDefined()
-    expect(settingsSpec.fields).toHaveLength(9)
+    expect(settingsSpec.fields).toHaveLength(11)
 
     const fieldKeys = settingsSpec.fields.map((f: any) => f.key)
+    expect(fieldKeys).toContain('autoAddModels')
+    expect(fieldKeys).toContain('autoRemoveModels')
     expect(fieldKeys).toContain('pricingUnit')
     expect(fieldKeys).toContain('checkModelsOnStartup')
     expect(fieldKeys).toContain('modelsRefreshIntervalMinutes')

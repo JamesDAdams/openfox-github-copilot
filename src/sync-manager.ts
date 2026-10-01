@@ -1,3 +1,6 @@
+import { readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 import type { ModelConfig } from 'openfox/provider'
 import type { GitHubCopilotAuthAdapter } from './auth/github-browser-auth.js'
 import type { ProviderCredentialStore } from './credentials/credential-store.js'
@@ -18,6 +21,7 @@ export interface SyncManagerOptions {
   settings?: GitHubCopilotPluginSettings
   modelsRefreshIntervalMs?: number
   pricesRefreshIntervalMs?: number
+  configDirectory?: string
 }
 
 export interface PriceDiff {
@@ -27,10 +31,115 @@ export interface PriceDiff {
   changes: string[]
 }
 
+function getCandidateConfigDirs(explicitDir?: string): string[] {
+  if (explicitDir) {
+    return [explicitDir]
+  }
+  const dirs: string[] = []
+  if (process.env.OPENFOX_CONFIG_DIR) dirs.push(process.env.OPENFOX_CONFIG_DIR)
+  try {
+    const home = homedir()
+    if (home) {
+      dirs.push(join(home, 'Library', 'Application Support', 'openfox-dev'))
+      dirs.push(join(home, 'Library', 'Application Support', 'openfox'))
+      dirs.push(join(home, '.config', 'openfox-dev'))
+      dirs.push(join(home, '.config', 'openfox'))
+    }
+  } catch {}
+  return Array.from(new Set(dirs))
+}
+
+export async function syncCopilotConfigProviders(
+  models: ModelConfig[],
+  removedModelIds: string[],
+  settings: GitHubCopilotPluginSettings,
+  configDirectory?: string,
+): Promise<{ added: number; removed: number }> {
+  const autoAdd = settings.autoAddModels !== false
+  const autoRemove = Boolean(settings.autoRemoveModels)
+  if (!autoAdd && !autoRemove) return { added: 0, removed: 0 }
+
+  const candidateDirs = getCandidateConfigDirs(configDirectory)
+  let totalAdded = 0
+  let totalRemoved = 0
+
+  for (const dir of candidateDirs) {
+    try {
+      const configPath = join(dir, 'config.json')
+      const raw = await readFile(configPath, 'utf8')
+      const config = JSON.parse(raw)
+      if (!Array.isArray(config?.providers)) continue
+
+      let changed = false
+      for (const p of config.providers) {
+        if (!p || typeof p !== 'object') continue
+        const backend = String(p.backend || '').toLowerCase()
+        const transport = String(p.transport || p.transportAdapter || '').toLowerCase()
+        const preset = String(p.preset || '').toLowerCase()
+        const authAdapter = String(p.authAdapter || '').toLowerCase()
+        const name = String(p.name || '').toLowerCase()
+        const id = String(p.id || '').toLowerCase()
+
+        const isMatch =
+          preset === 'github-copilot' ||
+          preset === 'copilot' ||
+          backend === 'github-copilot' ||
+          transport === 'github-copilot-transport' ||
+          authAdapter === 'github-copilot-auth' ||
+          name.includes('copilot') ||
+          id.includes('copilot')
+
+        if (!isMatch) continue
+
+        p.models = Array.isArray(p.models) ? p.models : []
+        const existingIds = new Set(p.models.map((m: any) => (typeof m === 'string' ? m : m.id)))
+
+        if (autoAdd && models.length > 0) {
+          for (const m of models) {
+            if (!existingIds.has(m.id)) {
+              p.models.push({
+                id: m.id,
+                name: m.name ?? m.id,
+                contextWindow: m.contextWindow ?? 128000,
+                source: 'backend',
+                ...(m.supportsVision ? { supportsVision: m.supportsVision } : {}),
+                ...(m.requestBody ? { requestBody: m.requestBody } : {}),
+                ...((m as any).pricing ? { pricing: (m as any).pricing } : {}),
+              })
+              existingIds.add(m.id)
+              totalAdded++
+              changed = true
+            }
+          }
+        }
+
+        if (autoRemove && removedModelIds.length > 0) {
+          const toRemove = new Set(removedModelIds)
+          const prevCount = p.models.length
+          p.models = p.models.filter((m: any) => !toRemove.has(typeof m === 'string' ? m : m.id))
+          if (p.models.length !== prevCount) {
+            totalRemoved += prevCount - p.models.length
+            changed = true
+          }
+        }
+      }
+
+      if (changed) {
+        await writeFile(configPath, JSON.stringify(config, null, 2), 'utf8')
+      }
+    } catch {
+      // Ignore read/parse/write errors for candidate directories
+    }
+  }
+
+  return { added: totalAdded, removed: totalRemoved }
+}
+
 export class GitHubCopilotSyncManager {
   private readonly auth: GitHubCopilotAuthAdapter
   private readonly credentials: ProviderCredentialStore
   private readonly transport: GitHubCopilotTransportAdapter
+  private readonly configDirectory?: string
   private notifier?: (notification: SyncNotification) => void
   private settings: GitHubCopilotPluginSettings
 
@@ -53,6 +162,7 @@ export class GitHubCopilotSyncManager {
     this.auth = options.auth
     this.credentials = options.credentials
     this.transport = options.transport
+    this.configDirectory = options.configDirectory
     this.notifier = options.notify
     this.settings = options.settings ?? { ...DEFAULT_SETTINGS }
     this.customModelsIntervalMs = options.modelsRefreshIntervalMs
@@ -210,6 +320,15 @@ export class GitHubCopilotSyncManager {
         this.knownModelIds = currentModelIds
       }
       this.isInitialModelsLoad = false
+
+      if (this.settings.autoAddModels !== false || (this.settings.autoRemoveModels && removedModels.length > 0)) {
+        await syncCopilotConfigProviders(
+          models,
+          removedModels,
+          this.settings,
+          this.configDirectory,
+        ).catch(() => {})
+      }
 
       if (this.notifier) {
         const changes: string[] = []

@@ -44,6 +44,8 @@ describe('PluginSettingsStore', () => {
       notifyOnNewModelsOnly: false,
       notifyOnEveryCheck: true,
       notifyOnPriceChanges: false,
+      autoAddModels: true,
+      autoRemoveModels: false,
     })
 
     const reloaded = await store.load()

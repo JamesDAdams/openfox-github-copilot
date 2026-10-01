@@ -61,6 +61,7 @@ export async function register(registry: ProviderPluginRegistry): Promise<void> 
     credentials,
     transport,
     settings: initialSettings,
+    configDirectory: registry.runtime.configDirectory,
     ...(notify ? { notify } : {}),
   })
   syncManager.start()
@@ -170,6 +171,34 @@ export async function register(registry: ProviderPluginRegistry): Promise<void> 
         fr: 'Configurer la découverte des modèles, l’affichage des prix et la synchronisation périodique.',
       },
       fields: [
+        {
+          key: 'autoAddModels',
+          label: {
+            en: 'Auto-add new models to provider',
+            fr: 'Ajouter automatiquement les nouveaux modèles',
+          },
+          type: 'boolean',
+          description: {
+            en: 'Automatically add newly discovered models to your configured provider in OpenFox.',
+            fr: 'Ajouter automatiquement les nouveaux modèles découverts à votre fournisseur configuré dans OpenFox.',
+          },
+          default: true,
+          defaultValue: true,
+        },
+        {
+          key: 'autoRemoveModels',
+          label: {
+            en: 'Auto-remove deleted models from provider',
+            fr: 'Retirer automatiquement les modèles supprimés',
+          },
+          type: 'boolean',
+          description: {
+            en: 'Automatically remove models that are no longer available from your configured provider in OpenFox.',
+            fr: 'Retirer automatiquement de votre fournisseur configuré les modèles qui ne sont plus disponibles.',
+          },
+          default: false,
+          defaultValue: false,
+        },
         {
           key: 'pricingUnit',
           label: {

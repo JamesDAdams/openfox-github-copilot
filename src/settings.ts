@@ -12,6 +12,8 @@ export interface GitHubCopilotPluginSettings {
   notifyOnNewModelsOnly: boolean
   notifyOnEveryCheck: boolean
   notifyOnPriceChanges: boolean
+  autoAddModels: boolean
+  autoRemoveModels: boolean
 }
 
 export const DEFAULT_SETTINGS: GitHubCopilotPluginSettings = {
@@ -23,6 +25,8 @@ export const DEFAULT_SETTINGS: GitHubCopilotPluginSettings = {
   notifyOnNewModelsOnly: true,
   notifyOnEveryCheck: false,
   notifyOnPriceChanges: true,
+  autoAddModels: true,
+  autoRemoveModels: false,
 }
 
 export class PluginSettingsStore {
@@ -65,6 +69,14 @@ export class PluginSettingsStore {
           typeof parsed.notifyOnPriceChanges === 'boolean'
             ? parsed.notifyOnPriceChanges
             : DEFAULT_SETTINGS.notifyOnPriceChanges,
+        autoAddModels:
+          typeof parsed.autoAddModels === 'boolean'
+            ? parsed.autoAddModels
+            : DEFAULT_SETTINGS.autoAddModels,
+        autoRemoveModels:
+          typeof parsed.autoRemoveModels === 'boolean'
+            ? parsed.autoRemoveModels
+            : DEFAULT_SETTINGS.autoRemoveModels,
       }
     } catch {
       return { ...DEFAULT_SETTINGS }
@@ -109,6 +121,14 @@ export class PluginSettingsStore {
         typeof values.notifyOnPriceChanges === 'boolean'
           ? values.notifyOnPriceChanges
           : existing.notifyOnPriceChanges,
+      autoAddModels:
+        typeof values.autoAddModels === 'boolean'
+          ? values.autoAddModels
+          : existing.autoAddModels,
+      autoRemoveModels:
+        typeof values.autoRemoveModels === 'boolean'
+          ? values.autoRemoveModels
+          : existing.autoRemoveModels,
     }
 
     await mkdir(dirname(this.settingsFilePath), { recursive: true })
