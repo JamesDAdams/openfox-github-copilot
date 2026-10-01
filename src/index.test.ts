@@ -199,6 +199,24 @@ describe('GitHubCopilotTransportAdapter.listModels', () => {
     expect(mockFetch).not.toHaveBeenCalled()
   })
 
+  it('lists models using providerId when credentialRef is undefined', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 'gpt-5-mini',
+            supported_endpoints: ['/chat/completions'],
+            capabilities: { type: 'chat', limits: { max_context_window_tokens: 200000 } },
+          },
+        ],
+      }),
+    })
+    const models = await adapter.listModels({ providerId: 'my-copilot-provider', signal: new AbortController().signal } as any)
+    expect(models.length).toBe(1)
+    expect(models[0]?.id).toBe('gpt-5-mini')
+  })
+
   it('returns empty models when credentialRef is an empty string and cache is empty', async () => {
     const models = await adapter.listModels(makeContext(''))
     expect(models.length).toBe(0)
@@ -1253,6 +1271,108 @@ describe('GitHubCopilotAuthAdapter.getStatus', () => {
     const status = await adapter.getStatus({ providerId: 'github-copilot', credentialRef: cachedRef })
     expect(status.state).toBe('connected')
     expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('resolves status by providerId when credentialRef is omitted', async () => {
+    await credentials.create({
+      providerId: 'provider-copilot-1',
+      oauthToken: 'gh-oauth-token',
+      username: 'copilot-user',
+      copilotToken: 'valid-tok',
+      copilotExpiresAt: 1_000_000_000 + 3600,
+    })
+
+    const status = await adapter.getStatus({ providerId: 'provider-copilot-1' })
+    expect(status.state).toBe('connected')
+    expect((status as any).accountLabel).toBe('copilot-user')
+  })
+
+  it('returns { state: "pending" } when login is in progress', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        device_code: 'dev-123',
+        user_code: 'CODE-1234',
+        verification_uri: 'https://github.com/login/device',
+        expires_in: 900,
+        interval: 5,
+      }),
+    })
+
+    await adapter.beginLogin({ providerId: 'provider-pending' })
+    const status = await adapter.getStatus({ providerId: 'provider-pending' })
+    expect(status.state).toBe('pending')
+  })
+
+  it('regenerates challenge in beginLogin if previous challenge is expired', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        device_code: 'dev-old',
+        user_code: 'OLD-1234',
+        verification_uri: 'https://github.com/login/device',
+        expires_in: 10,
+        interval: 5,
+      }),
+    })
+
+    const first = await adapter.beginLogin({ providerId: 'provider-exp' })
+    expect(first.challenge.userCode).toBe('OLD-1234')
+
+    // Advance time past expiration
+    const advancedAdapter = new GitHubCopilotAuthAdapter(credentials, {
+      now: () => 1_000_000_000_000 + 20_000,
+      fetcher: mockFetch as any,
+    })
+    ;(advancedAdapter as any).activeLogins.set('provider-exp', first)
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        device_code: 'dev-new',
+        user_code: 'NEW-5678',
+        verification_uri: 'https://github.com/login/device',
+        expires_in: 900,
+        interval: 5,
+      }),
+    })
+
+    const second = await advancedAdapter.beginLogin({ providerId: 'provider-exp' })
+    expect(second.challenge.userCode).toBe('NEW-5678')
+  })
+
+  it('resolves access context and oauth token by providerId', async () => {
+    await credentials.create({
+      providerId: 'provider-copilot-access',
+      oauthToken: 'oauth-secret',
+      username: 'copilot-user',
+      copilotToken: 'copilot-access-token',
+      copilotExpiresAt: 1_000_000_000 + 3600,
+    })
+
+    const access = await adapter.getAccessContext('provider-copilot-access')
+    expect(access.accessToken).toBe('copilot-access-token')
+    expect(access.headers?.['Authorization']).toBe('Bearer copilot-access-token')
+
+    const oauthToken = await adapter.getOAuthToken('provider-copilot-access')
+    expect(oauthToken).toBe('oauth-secret')
+  })
+
+  it('deletes credentials matching providerId on deleteProvider', async () => {
+    const ref1 = await credentials.create({
+      providerId: 'provider-to-delete',
+      oauthToken: 'tok1',
+      username: 'user1',
+    })
+    const ref2 = await credentials.create({
+      providerId: 'other-provider',
+      oauthToken: 'tok2',
+      username: 'user2',
+    })
+
+    await adapter.deleteProvider('provider-to-delete')
+    expect(await credentials.get(ref1)).toBeUndefined()
+    expect(await credentials.get(ref2)).toBeDefined()
   })
 })
 

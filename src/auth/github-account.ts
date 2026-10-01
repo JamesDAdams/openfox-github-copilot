@@ -1,6 +1,7 @@
 import type { ProviderCredentialStore } from '../credentials/credential-store.js'
 
 export interface GitHubCopilotCredential {
+  providerId?: string
   oauthToken: string
   username: string
   copilotToken?: string

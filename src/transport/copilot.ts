@@ -178,11 +178,12 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
   }
 
   async listModels(context: ProviderRequestContext): Promise<ModelConfig[]> {
-    if (!context.credentialRef) return this.cachedModels
+    const ref = context.credentialRef ?? context.providerId
+    if (!ref) return this.cachedModels
 
     let access: ProviderAccessContext
     try {
-      access = await this.auth.getAccessContext(context.credentialRef)
+      access = await this.auth.getAccessContext(ref)
     } catch {
       return this.cachedModels
     }
@@ -194,7 +195,7 @@ export class GitHubCopilotTransportAdapter implements ProviderTransportAdapter {
       return copilotModels
     }
 
-    const catalog = await this.fetchGitHubCatalog(context.credentialRef)
+    const catalog = await this.fetchGitHubCatalog(ref)
     if (catalog.length > 0) {
       this.cachedModels = catalog
       return catalog
